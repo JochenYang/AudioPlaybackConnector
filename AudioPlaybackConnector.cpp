@@ -5,6 +5,7 @@ LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
 winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
+winrt::fire_and_forget ReconnectDeviceTask(std::wstring);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
@@ -113,8 +114,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 		else
 		{
-			g_audioPlaybackConnections.clear();
 			SaveSettings();
+			g_audioPlaybackConnections.clear();
 		}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
@@ -187,6 +188,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			g_lastDevices.clear();
 		}
 		break;
+	case WM_RECONNECTDEVICE:
+	{
+		auto deviceId = reinterpret_cast<wchar_t*>(wParam);
+		if (deviceId)
+		{
+			std::wstring deviceIdStr = deviceId;
+			delete[] deviceId; // Free the allocated string
+			ReconnectDeviceTask(std::move(deviceIdStr));
+		}
+	}
+	break;
 	default:
 		if (WM_TASKBAR_CREATED && message == WM_TASKBAR_CREATED)
 		{
@@ -310,9 +322,11 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					if (it != g_audioPlaybackConnections.end())
 					{
 						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
+						// Post message to main thread for delayed reconnect - avoids race condition on g_audioPlaybackConnections
+						auto deviceId = new std::wstring(sender.DeviceId());
+						PostMessageW(g_hWnd, WM_RECONNECTDEVICE, reinterpret_cast<WPARAM>(deviceId), 0);
 						g_audioPlaybackConnections.erase(it);
 					}
-					sender.Close();
 				}
 			});
 
@@ -383,7 +397,24 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
 {
 	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+	if (device.Name().empty())
+	{
+		picker.SetDisplayStatus(device, _(L"Device not available"), DevicePickerDisplayStatusOptions::ShowRetryButton);
+		co_return;
+	}
 	ConnectDevice(picker, device);
+}
+
+winrt::fire_and_forget ReconnectDeviceTask(std::wstring deviceId)
+{
+	// Delay to allow audio subsystem to release resources before allowing reconnect
+	co_await winrt::resume_after(std::chrono::milliseconds(500));
+
+	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+	if (!device.Name().empty())
+	{
+		ConnectDevice(g_devicePicker, device);
+	}
 }
 
 void SetupDevicePicker()
