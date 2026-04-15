@@ -330,26 +330,45 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 				}
 			});
 
-			co_await connection.StartAsync();
-			auto result = co_await connection.OpenAsync();
-
-			switch (result.Status())
+			try
 			{
-			case AudioPlaybackConnectionOpenResultStatus::Success:
-				success = true;
-				break;
-			case AudioPlaybackConnectionOpenResultStatus::RequestTimedOut:
-				success = false;
-				errorMessage = _(L"The request timed out");
-				break;
-			case AudioPlaybackConnectionOpenResultStatus::DeniedBySystem:
-				success = false;
-				errorMessage = _(L"The operation was denied by the system");
-				break;
-			case AudioPlaybackConnectionOpenResultStatus::UnknownFailure:
-				success = false;
-				winrt::throw_hresult(result.ExtendedError());
-				break;
+				co_await connection.StartAsync();
+				auto result = co_await connection.OpenAsync();
+
+				switch (result.Status())
+				{
+				case AudioPlaybackConnectionOpenResultStatus::Success:
+					success = true;
+					break;
+				case AudioPlaybackConnectionOpenResultStatus::RequestTimedOut:
+					success = false;
+					errorMessage = _(L"The request timed out");
+					break;
+				case AudioPlaybackConnectionOpenResultStatus::DeniedBySystem:
+					success = false;
+					errorMessage = _(L"The operation was denied by the system");
+					break;
+				case AudioPlaybackConnectionOpenResultStatus::UnknownFailure:
+					success = false;
+					winrt::throw_hresult(result.ExtendedError());
+					break;
+				}
+			}
+			catch (...)
+			{
+				// OpenAsync or StartAsync threw an exception - clean up the map entry before propagating
+				auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+				if (it != g_audioPlaybackConnections.end())
+				{
+					try {
+						it->second.second.Close();
+					} catch (...) {
+						// Log but don't let Close failure mask the original exception
+						LOG_CAUGHT_EXCEPTION();
+					}
+					g_audioPlaybackConnections.erase(it);
+				}
+				throw; // re-throw to let outer catch handle error message display
 			}
 		}
 		else
