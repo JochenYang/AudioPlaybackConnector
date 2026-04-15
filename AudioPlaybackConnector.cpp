@@ -333,6 +333,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			try
 			{
 				co_await connection.StartAsync();
+				co_await winrt::resume_after(std::chrono::milliseconds(200));
 				auto result = co_await connection.OpenAsync();
 
 				switch (result.Status())
