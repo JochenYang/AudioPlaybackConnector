@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <filesystem>
+#include <mutex>
 
 // wil
 #ifndef _DEBUG

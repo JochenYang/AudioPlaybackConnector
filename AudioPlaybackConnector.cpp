@@ -10,6 +10,9 @@ void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
 
+static std::mutex g_connMutex;
+static UINT WM_UI_UPDATE = 0;
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
 	_In_ LPWSTR    lpCmdLine,
@@ -53,6 +56,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	};
 
 	RegisterClassExW(&wcex);
+
+	WM_UI_UPDATE = RegisterWindowMessageW(L"WM_UI_UPDATE");
+	LOG_LAST_ERROR_IF(WM_UI_UPDATE == 0);
 
 	// When parent window size is 0x0 or invisible, the dpi scale of menu is incorrect. Here we set window size to 1x1 and use WS_EX_LAYERED to make window looks like invisible.
 	g_hWnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST, L"AudioPlaybackConnector", nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
@@ -102,6 +108,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message)
 	{
 	case WM_DESTROY:
+	{
+		std::lock_guard<std::mutex> lock(g_connMutex);
 		for (const auto& connection : g_audioPlaybackConnections)
 		{
 			connection.second.second.Close();
@@ -117,6 +125,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			SaveSettings();
 			g_audioPlaybackConnections.clear();
 		}
+	}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
 		break;
@@ -190,15 +199,32 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 	case WM_RECONNECTDEVICE:
 	{
-		auto deviceId = reinterpret_cast<wchar_t*>(wParam);
-		if (deviceId)
+		auto deviceIdStr = reinterpret_cast<std::wstring*>(wParam);
+		if (deviceIdStr)
 		{
-			std::wstring deviceIdStr = deviceId;
-			delete[] deviceId; // Free the allocated string
-			ReconnectDeviceTask(std::move(deviceIdStr));
+			ReconnectDeviceTask(std::move(*deviceIdStr));
+			delete deviceIdStr; // Free the allocated std::wstring
 		}
 	}
 	break;
+	if (WM_UI_UPDATE && message == WM_UI_UPDATE)
+	{
+		auto p = reinterpret_cast<std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>*>(wParam);
+		if (p)
+		{
+			bool isActive = (lParam == 1);
+			if (isActive)
+			{
+				g_devicePicker.SetDisplayStatus(p->second, _(L"Connected"),
+					DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+			}
+			else
+			{
+				g_devicePicker.SetDisplayStatus(p->second, {}, DevicePickerDisplayStatusOptions::None);
+			}
+			delete p;
+		}
+	}
 	default:
 		if (WM_TASKBAR_CREATED && message == WM_TASKBAR_CREATED)
 		{
@@ -259,10 +285,13 @@ void SetupMenu()
 	exitItem.Text(_(L"Exit"));
 	exitItem.Icon(closeIcon);
 	exitItem.Click([](const auto&, const auto&) {
-		if (g_audioPlaybackConnections.size() == 0)
 		{
-			PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
-			return;
+			std::lock_guard lock(g_connMutex);
+			if (g_audioPlaybackConnections.size() == 0)
+			{
+				PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
+				return;
+			}
 		}
 
 		RECT iconRect;
@@ -313,20 +342,37 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
-			g_audioPlaybackConnections.emplace(device.Id(), std::pair(device, connection));
+			{
+				std::lock_guard lock(g_connMutex);
+				g_audioPlaybackConnections.emplace(device.Id(), std::pair(device, connection));
+			}
 
 			connection.StateChanged([](const auto& sender, const auto&) {
-				if (sender.State() == AudioPlaybackConnectionState::Closed)
+				auto deviceId = std::wstring(sender.DeviceId());
+				std::lock_guard lock(g_connMutex);
+				auto it = g_audioPlaybackConnections.find(deviceId);
+				if (it == g_audioPlaybackConnections.end())
 				{
-					auto it = g_audioPlaybackConnections.find(std::wstring(sender.DeviceId()));
-					if (it != g_audioPlaybackConnections.end())
-					{
-						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
-						// Post message to main thread for delayed reconnect - avoids race condition on g_audioPlaybackConnections
-						auto deviceId = new std::wstring(sender.DeviceId());
-						PostMessageW(g_hWnd, WM_RECONNECTDEVICE, reinterpret_cast<WPARAM>(deviceId), 0);
-						g_audioPlaybackConnections.erase(it);
-					}
+					return; // Device already removed or doesn't exist
+				}
+
+				if (sender.State() == AudioPlaybackConnectionState::Opened)
+				{
+					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
+					auto deviceCopy = it->second.first;
+					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
+					PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 1);
+				}
+				else if (sender.State() == AudioPlaybackConnectionState::Closed)
+				{
+					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
+					auto deviceCopy = it->second.first;
+					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
+					PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0);
+					// Post message to main thread for delayed reconnect - avoids race condition on g_audioPlaybackConnections
+					auto deviceIdAlloc = new std::wstring(deviceId);
+					PostMessageW(g_hWnd, WM_RECONNECTDEVICE, reinterpret_cast<WPARAM>(deviceIdAlloc), 0);
+					g_audioPlaybackConnections.erase(it);
 				}
 			});
 
@@ -358,6 +404,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			catch (...)
 			{
 				// OpenAsync or StartAsync threw an exception - clean up the map entry before propagating
+				std::lock_guard lock(g_connMutex);
 				auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
 				if (it != g_audioPlaybackConnections.end())
 				{
@@ -400,10 +447,12 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 	if (success)
 	{
-		picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+		// Don't set "Connected" here - wait for StateChanged(Active) to confirm audio stream is ready
+		// The UI will continue showing "Connecting..." until Active state is received
 	}
 	else
 	{
+		std::lock_guard lock(g_connMutex);
 		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
 		if (it != g_audioPlaybackConnections.end())
 		{
@@ -451,11 +500,14 @@ void SetupDevicePicker()
 	});
 	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
 		auto device = args.Device();
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
-		if (it != g_audioPlaybackConnections.end())
 		{
-			it->second.second.Close();
-			g_audioPlaybackConnections.erase(it);
+			std::lock_guard lock(g_connMutex);
+			auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+			if (it != g_audioPlaybackConnections.end())
+			{
+				it->second.second.Close();
+				g_audioPlaybackConnections.erase(it);
+			}
 		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
 	});
