@@ -447,8 +447,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 	if (success)
 	{
-		// Don't set "Connected" here - wait for StateChanged(Active) to confirm audio stream is ready
-		// The UI will continue showing "Connecting..." until Active state is received
+		picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 	}
 	else
 	{
