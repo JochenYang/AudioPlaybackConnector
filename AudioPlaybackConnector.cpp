@@ -9,9 +9,18 @@ winrt::fire_and_forget ReconnectDeviceTask(std::wstring);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
+winrt::Windows::Foundation::IAsyncOperation<bool> WaitForConnectionStateAsync(
+	winrt::Windows::Media::Audio::AudioPlaybackConnection connection,
+	winrt::Windows::Media::Audio::AudioPlaybackConnectionState expectedState,
+	std::chrono::milliseconds timeout,
+	std::chrono::milliseconds pollInterval = std::chrono::milliseconds(50));
 
 static std::mutex g_connMutex;
 static UINT WM_UI_UPDATE = 0;
+static std::unordered_set<std::wstring> g_pendingConnections;
+static constexpr auto kInitialOpenDelay = std::chrono::milliseconds(200);
+static constexpr auto kReconnectOpenDelay = std::chrono::milliseconds(500);
+static constexpr auto kOpenedWaitTimeout = std::chrono::milliseconds(350);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -105,6 +114,26 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+	if (WM_UI_UPDATE && message == WM_UI_UPDATE)
+	{
+		auto p = reinterpret_cast<std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>*>(wParam);
+		if (p)
+		{
+			bool isActive = (lParam == 1);
+			if (isActive)
+			{
+				g_devicePicker.SetDisplayStatus(p->second, _(L"Connected"),
+					DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+			}
+			else
+			{
+				g_devicePicker.SetDisplayStatus(p->second, {}, DevicePickerDisplayStatusOptions::None);
+			}
+			delete p;
+		}
+		return 0;
+	}
+
 	switch (message)
 	{
 	case WM_DESTROY:
@@ -125,6 +154,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			SaveSettings();
 			g_audioPlaybackConnections.clear();
 		}
+		g_pendingConnections.clear();
 	}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
@@ -192,7 +222,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 			for (const auto& i : g_lastDevices)
 			{
-				ConnectDevice(g_devicePicker, i);
+				// Reuse the reconnect path on startup so the Bluetooth audio route
+				// has time to fully release after the previous process exits.
+				ReconnectDeviceTask(i);
 			}
 			g_lastDevices.clear();
 		}
@@ -207,24 +239,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 	}
 	break;
-	if (WM_UI_UPDATE && message == WM_UI_UPDATE)
-	{
-		auto p = reinterpret_cast<std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>*>(wParam);
-		if (p)
-		{
-			bool isActive = (lParam == 1);
-			if (isActive)
-			{
-				g_devicePicker.SetDisplayStatus(p->second, _(L"Connected"),
-					DevicePickerDisplayStatusOptions::ShowDisconnectButton);
-			}
-			else
-			{
-				g_devicePicker.SetDisplayStatus(p->second, {}, DevicePickerDisplayStatusOptions::None);
-			}
-			delete p;
-		}
-	}
 	default:
 		if (WM_TASKBAR_CREATED && message == WM_TASKBAR_CREATED)
 		{
@@ -330,21 +344,82 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
+winrt::Windows::Foundation::IAsyncOperation<bool> WaitForConnectionStateAsync(
+	AudioPlaybackConnection connection,
+	AudioPlaybackConnectionState expectedState,
+	std::chrono::milliseconds timeout,
+	std::chrono::milliseconds pollInterval)
+{
+	if (connection.State() == expectedState)
+	{
+		co_return true;
+	}
+
+	auto elapsed = std::chrono::milliseconds(0);
+	while (elapsed < timeout)
+	{
+		co_await winrt::resume_after(pollInterval);
+		elapsed += pollInterval;
+
+		if (connection.State() == expectedState)
+		{
+			co_return true;
+		}
+
+		if (connection.State() == AudioPlaybackConnectionState::Closed)
+		{
+			co_return false;
+		}
+	}
+
+	co_return connection.State() == expectedState;
+}
+
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
 {
 	picker.SetDisplayStatus(device, _(L"Connecting"), DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 
-	bool success = false;
+	bool openRequested = false;
 	std::wstring errorMessage;
+	auto deviceId = std::wstring(device.Id());
 
 	try
 	{
+		{
+			std::lock_guard lock(g_connMutex);
+			if (g_pendingConnections.contains(deviceId))
+			{
+				co_return;
+			}
+
+			auto existing = g_audioPlaybackConnections.find(deviceId);
+			if (existing != g_audioPlaybackConnections.end())
+			{
+				if (existing->second.second.State() == AudioPlaybackConnectionState::Opened)
+				{
+					picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+				}
+				co_return;
+			}
+
+			g_pendingConnections.insert(deviceId);
+		}
+
 		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
 			{
 				std::lock_guard lock(g_connMutex);
-				g_audioPlaybackConnections.emplace(device.Id(), std::pair(device, connection));
+				auto [_, inserted] = g_audioPlaybackConnections.emplace(deviceId, std::pair(device, connection));
+				if (!inserted)
+				{
+					g_pendingConnections.erase(deviceId);
+					if (connection.State() == AudioPlaybackConnectionState::Opened)
+					{
+						picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+					}
+					co_return;
+				}
 			}
 
 			connection.StateChanged([](const auto& sender, const auto&) {
@@ -358,6 +433,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 				if (sender.State() == AudioPlaybackConnectionState::Opened)
 				{
+					g_pendingConnections.erase(deviceId);
 					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
 					auto deviceCopy = it->second.first;
 					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
@@ -365,6 +441,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 				}
 				else if (sender.State() == AudioPlaybackConnectionState::Closed)
 				{
+					g_pendingConnections.erase(deviceId);
 					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
 					auto deviceCopy = it->second.first;
 					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
@@ -379,24 +456,27 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			try
 			{
 				co_await connection.StartAsync();
-				co_await winrt::resume_after(std::chrono::milliseconds(500));
+				co_await winrt::resume_after(kInitialOpenDelay);
 				auto result = co_await connection.OpenAsync();
 
 				switch (result.Status())
 				{
 				case AudioPlaybackConnectionOpenResultStatus::Success:
-					success = true;
+					openRequested = true;
+					if (co_await WaitForConnectionStateAsync(connection, AudioPlaybackConnectionState::Opened, kOpenedWaitTimeout))
+					{
+						std::lock_guard lock(g_connMutex);
+						g_pendingConnections.erase(deviceId);
+						picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+					}
 					break;
 				case AudioPlaybackConnectionOpenResultStatus::RequestTimedOut:
-					success = false;
 					errorMessage = _(L"The request timed out");
 					break;
 				case AudioPlaybackConnectionOpenResultStatus::DeniedBySystem:
-					success = false;
 					errorMessage = _(L"The operation was denied by the system");
 					break;
 				case AudioPlaybackConnectionOpenResultStatus::UnknownFailure:
-					success = false;
 					winrt::throw_hresult(result.ExtendedError());
 					break;
 				}
@@ -405,7 +485,8 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			{
 				// OpenAsync or StartAsync threw an exception - clean up the map entry before propagating
 				std::lock_guard lock(g_connMutex);
-				auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+				g_pendingConnections.erase(deviceId);
+				auto it = g_audioPlaybackConnections.find(deviceId);
 				if (it != g_audioPlaybackConnections.end())
 				{
 					try {
@@ -421,13 +502,11 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		}
 		else
 		{
-			success = false;
 			errorMessage = _(L"Unknown error");
 		}
 	}
 	catch (winrt::hresult_error const& ex)
 	{
-		success = false;
 		errorMessage.resize(64);
 		while (1)
 		{
@@ -445,14 +524,11 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		LOG_CAUGHT_EXCEPTION();
 	}
 
-	if (success)
-	{
-		picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
-	}
-	else
+	if (!openRequested)
 	{
 		std::lock_guard lock(g_connMutex);
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+		g_pendingConnections.erase(deviceId);
+		auto it = g_audioPlaybackConnections.find(deviceId);
 		if (it != g_audioPlaybackConnections.end())
 		{
 			it->second.second.Close();
@@ -476,7 +552,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view devi
 winrt::fire_and_forget ReconnectDeviceTask(std::wstring deviceId)
 {
 	// Delay to allow audio subsystem to release resources before allowing reconnect
-	co_await winrt::resume_after(std::chrono::milliseconds(500));
+	co_await winrt::resume_after(kReconnectOpenDelay);
 
 	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
 	if (!device.Name().empty())
@@ -501,6 +577,7 @@ void SetupDevicePicker()
 		auto device = args.Device();
 		{
 			std::lock_guard lock(g_connMutex);
+			g_pendingConnections.erase(std::wstring(device.Id()));
 			auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
 			if (it != g_audioPlaybackConnections.end())
 			{
