@@ -18,9 +18,26 @@ winrt::Windows::Foundation::IAsyncOperation<bool> WaitForConnectionStateAsync(
 static std::mutex g_connMutex;
 static UINT WM_UI_UPDATE = 0;
 static std::unordered_set<std::wstring> g_pendingConnections;
-static constexpr auto kInitialOpenDelay = std::chrono::milliseconds(200);
+// Per-device timestamp of the most recent disconnect. Used to enforce a
+// cooldown before the next connect, so the underlying A2DP audio route has
+// time to fully release. Without this, a manual disconnect followed by an
+// immediate reconnect can land on a half-released endpoint that reports
+// Opened but produces no audio - the "must connect twice" symptom.
+static std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> g_lastDisconnectTime;
+static constexpr auto kInitialOpenDelay = std::chrono::milliseconds(500);
 static constexpr auto kReconnectOpenDelay = std::chrono::milliseconds(500);
-static constexpr auto kOpenedWaitTimeout = std::chrono::milliseconds(350);
+static constexpr auto kOpenedWaitTimeout = std::chrono::milliseconds(1500);
+// Minimum gap between a disconnect and the next connect on the SAME device.
+// Covers the manual disconnect -> manual reconnect path that previously had
+// no release window at all (only the auto-reconnect path was protected).
+static constexpr auto kPostDisconnectCooldown = std::chrono::milliseconds(1500);
+// Hard ceiling on a single OpenAsync call. Some Bluetooth stacks (notably
+// Realtek) can leave OpenAsync pending indefinitely on driver hiccups, which
+// would strand the device id in g_pendingConnections and silently dedupe
+// every subsequent user retry (the "click does nothing" lockup). The
+// watchdog cancels the op after this timeout so the outer catch can clean
+// up and surface a retryable error to the UI.
+static constexpr auto kOpenAsyncTimeout = std::chrono::seconds(5);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -144,17 +161,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			connection.second.second.Close();
 			g_devicePicker.SetDisplayStatus(connection.second.first, {}, DevicePickerDisplayStatusOptions::None);
 		}
-		if (g_reconnect)
-		{
-			SaveSettings();
-			g_audioPlaybackConnections.clear();
-		}
-		else
-		{
-			SaveSettings();
-			g_audioPlaybackConnections.clear();
-		}
+		// SaveSettings encodes the current g_reconnect flag into the JSON;
+		// LoadSettings on next startup decides whether to actually reconnect.
+		// Both branches were identical, collapsed to remove the dead split.
+		SaveSettings();
+		g_audioPlaybackConnections.clear();
 		g_pendingConnections.clear();
+		g_lastDisconnectTime.clear();
 	}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
@@ -405,6 +418,36 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			g_pendingConnections.insert(deviceId);
 		}
 
+		// Step 1-2-3 post-disconnect cooldown (executed OUTSIDE the lock):
+		// 1. Look up when this device was last disconnected.
+		// 2. If still within the cooldown window, await the remaining time so
+		//    the Bluetooth stack can finish releasing the prior A2DP route.
+		// 3. Skipping this lets OpenAsync land on a half-released endpoint
+		//    that reports Opened but routes no audio - the root cause of the
+		//    "first reconnect has no sound" symptom on consumer BT chips.
+		std::chrono::milliseconds remainingCooldown(0);
+		{
+			std::lock_guard lock(g_connMutex);
+			auto it = g_lastDisconnectTime.find(deviceId);
+			if (it != g_lastDisconnectTime.end())
+			{
+				auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - it->second);
+				if (elapsed < kPostDisconnectCooldown)
+				{
+					remainingCooldown = kPostDisconnectCooldown - elapsed;
+				}
+				else
+				{
+					g_lastDisconnectTime.erase(it);
+				}
+			}
+		}
+		if (remainingCooldown.count() > 0)
+		{
+			co_await winrt::resume_after(remainingCooldown);
+		}
+
 		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
@@ -442,6 +485,10 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 				else if (sender.State() == AudioPlaybackConnectionState::Closed)
 				{
 					g_pendingConnections.erase(deviceId);
+					// Stamp the disconnect time so a follow-up connect on the
+					// same device waits out kPostDisconnectCooldown for the
+					// A2DP route to fully release before reopening.
+					g_lastDisconnectTime[deviceId] = std::chrono::steady_clock::now();
 					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
 					auto deviceCopy = it->second.first;
 					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
@@ -457,7 +504,23 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			{
 				co_await connection.StartAsync();
 				co_await winrt::resume_after(kInitialOpenDelay);
-				auto result = co_await connection.OpenAsync();
+				// Step 1-2-3 watchdog around OpenAsync to defeat driver hangs:
+				// 1. Capture the in-flight op so we can race it.
+				// 2. Spawn a fire-and-forget timer that cancels the op if it
+				//    hasn't completed within kOpenAsyncTimeout.
+				// 3. Awaiting a cancelled op throws hresult_canceled, which the
+				//    outer catch turns into a retryable error - critical for
+				//    breaking the "next click does nothing" lockup caused by a
+				//    coroutine stuck on a non-responsive Bluetooth stack.
+				auto openOp = connection.OpenAsync();
+				[](winrt::Windows::Foundation::IAsyncOperation<AudioPlaybackConnectionOpenResult> op) -> winrt::fire_and_forget {
+					co_await winrt::resume_after(kOpenAsyncTimeout);
+					if (op.Status() == winrt::Windows::Foundation::AsyncStatus::Started)
+					{
+						op.Cancel();
+					}
+				}(openOp);
+				auto result = co_await openOp;
 
 				switch (result.Status())
 				{
@@ -467,7 +530,20 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					{
 						std::lock_guard lock(g_connMutex);
 						g_pendingConnections.erase(deviceId);
+						// Successful open clears any stale cooldown stamp so a
+						// later disconnect+reconnect cycle restarts the timer.
+						g_lastDisconnectTime.erase(deviceId);
 						picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+					}
+					else
+					{
+						// Step 1-2-3 fallback when Opened is not observed in time:
+						// 1. Mark the attempt as failed so the outer cleanup runs.
+						// 2. Surface a retryable error instead of leaving "Connecting".
+						// 3. Cleanup will Close() the half-open connection, which
+						//    fires StateChanged Closed and triggers auto-reconnect.
+						openRequested = false;
+						errorMessage = _(L"The request timed out");
 					}
 					break;
 				case AudioPlaybackConnectionOpenResultStatus::RequestTimedOut:
@@ -575,14 +651,20 @@ void SetupDevicePicker()
 	});
 	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
 		auto device = args.Device();
+		auto deviceIdStr = std::wstring(device.Id());
 		{
 			std::lock_guard lock(g_connMutex);
-			g_pendingConnections.erase(std::wstring(device.Id()));
-			auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+			g_pendingConnections.erase(deviceIdStr);
+			auto it = g_audioPlaybackConnections.find(deviceIdStr);
 			if (it != g_audioPlaybackConnections.end())
 			{
 				it->second.second.Close();
 				g_audioPlaybackConnections.erase(it);
+				// Stamp the disconnect time so an immediate user-driven
+				// reconnect on the same device waits for the A2DP route to
+				// release. Without this, the next OpenAsync may complete on
+				// a stale endpoint that reports Opened but produces no audio.
+				g_lastDisconnectTime[deviceIdStr] = std::chrono::steady_clock::now();
 			}
 		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);

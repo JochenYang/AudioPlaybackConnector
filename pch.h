@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include <filesystem>
 #include <mutex>
+#include <chrono>
 
 // wil
 #ifndef _DEBUG
