@@ -164,6 +164,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		for (const auto& connection : g_audioPlaybackConnections)
 		{
 			connection.second.second.Close();
+			// Flush any lingering A2DP state in USB Bluetooth dongle firmware
+			// so a fresh session (after restart) doesn't land on stale endpoint.
+			auto flushConn = AudioPlaybackConnection::TryCreateFromId(connection.first);
+			if (flushConn) flushConn.Close();
 			g_devicePicker.SetDisplayStatus(connection.second.first, {}, DevicePickerDisplayStatusOptions::None);
 		}
 		// SaveSettings encodes the current g_reconnect flag into the JSON;
@@ -456,6 +460,15 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			co_await winrt::resume_after(remainingCooldown);
 		}
 
+		// USB Bluetooth dongles cache A2DP endpoint state in their firmware.
+		// Creating a temp connection and immediately closing it before the
+		// real one prods the dongle to flush stale state from prior sessions
+		// so the subsequent OpenAsync lands on a fresh internal endpoint.
+		{
+			auto flushConn = AudioPlaybackConnection::TryCreateFromId(device.Id());
+			if (flushConn) flushConn.Close();
+		}
+
 		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
@@ -701,6 +714,13 @@ void SetupDevicePicker()
 			if (it != g_audioPlaybackConnections.end())
 			{
 				it->second.second.Close();
+				// USB Bluetooth dongles (CSR/Realtek etc.) cache A2DP endpoint
+				// state in their firmware after Close(). Creating and immediately
+				// closing a temp connection prods the dongle to flush that state
+				// so the next OpenAsync lands on a clean endpoint instead of a
+				// half-released one that reports Opened but routes no audio.
+				auto flushConn = AudioPlaybackConnection::TryCreateFromId(deviceIdStr);
+				if (flushConn) flushConn.Close();
 				g_audioPlaybackConnections.erase(it);
 				// Stamp the disconnect time so an immediate user-driven
 				// reconnect on the same device waits for the A2DP route to
