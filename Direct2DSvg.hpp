@@ -1,6 +1,6 @@
 #pragma once
 
-void DrawSvgTohDC(std::string_view svg, HDC hdc, LONG width, LONG height, const D2D1_COLOR_F& color)
+inline void DrawSvgTohDC(std::string_view svg, HDC hdc, LONG width, LONG height, const D2D1_COLOR_F& color)
 {
 	winrt::com_ptr<ID2D1Factory> factory;
 	winrt::check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory.put()));
@@ -40,7 +40,7 @@ void DrawSvgTohDC(std::string_view svg, HDC hdc, LONG width, LONG height, const 
 	dc->EndDraw();
 }
 
-auto CreateDIB(HDC hdc, LONG width, LONG height, WORD bitCount)
+inline auto CreateDIB(HDC hdc, LONG width, LONG height, WORD bitCount)
 {
 	BITMAPINFO bmi = { .bmiHeader = {
 		.biSize = sizeof(BITMAPINFOHEADER),
@@ -53,7 +53,7 @@ auto CreateDIB(HDC hdc, LONG width, LONG height, WORD bitCount)
 	return wil::unique_hbitmap(CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, nullptr, nullptr, 0));
 }
 
-HICON SvgTohIcon(std::string_view svg, LONG width, LONG height, const D2D1_COLOR_F& color)
+inline HICON SvgTohIcon(std::string_view svg, LONG width, LONG height, const D2D1_COLOR_F& color)
 {
 	wil::unique_hdc hdc(CreateCompatibleDC(nullptr));
 	THROW_IF_NULL_ALLOC(hdc);

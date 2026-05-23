@@ -30,7 +30,7 @@ static constexpr auto kOpenedWaitTimeout = std::chrono::milliseconds(1500);
 // Minimum gap between a disconnect and the next connect on the SAME device.
 // Covers the manual disconnect -> manual reconnect path that previously had
 // no release window at all (only the auto-reconnect path was protected).
-static constexpr auto kPostDisconnectCooldown = std::chrono::milliseconds(1500);
+static constexpr auto kPostDisconnectCooldown = std::chrono::milliseconds(3000);
 // Hard ceiling on a single OpenAsync call. Some Bluetooth stacks (notably
 // Realtek) can leave OpenAsync pending indefinitely on driver hiccups, which
 // would strand the device id in g_pendingConnections and silently dedupe
@@ -38,6 +38,10 @@ static constexpr auto kPostDisconnectCooldown = std::chrono::milliseconds(1500);
 // watchdog cancels the op after this timeout so the outer catch can clean
 // up and surface a retryable error to the UI.
 static constexpr auto kOpenAsyncTimeout = std::chrono::seconds(5);
+// Flipped in WM_DESTROY before any cleanup begins. fire_and_forget coroutines
+// running on the WinRT thread-pool check this at their earliest resumption
+// point and bail out, preventing accesses to already-destroyed globals.
+static bool g_shuttingDown = false;
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -155,6 +159,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 	case WM_DESTROY:
 	{
+		g_shuttingDown = true;
 		std::lock_guard<std::mutex> lock(g_connMutex);
 		for (const auto& connection : g_audioPlaybackConnections)
 		{
@@ -170,6 +175,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		g_lastDisconnectTime.clear();
 	}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
+		if (g_hIconLight) { DestroyIcon(g_hIconLight); g_hIconLight = nullptr; }
+		if (g_hIconDark) { DestroyIcon(g_hIconDark); g_hIconDark = nullptr; }
 		PostQuitMessage(0);
 		break;
 	case WM_SETTINGCHANGE:
@@ -268,14 +275,14 @@ void SetupFlyout()
 	textBlock.Text(_(L"All connections will be closed.\nExit anyway?"));
 	textBlock.Margin({ 0, 0, 0, 12 });
 
-	static CheckBox checkbox;
+	CheckBox checkbox;
 	checkbox.IsChecked(g_reconnect);
 	checkbox.Content(winrt::box_value(_(L"Reconnect on next start")));
 
 	Button button;
 	button.Content(winrt::box_value(_(L"Exit")));
 	button.HorizontalAlignment(HorizontalAlignment::Right);
-	button.Click([](const auto&, const auto&) {
+	button.Click([&](const auto&, const auto&) {
 		g_reconnect = checkbox.IsChecked().Value();
 		PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
 	});
@@ -390,6 +397,7 @@ winrt::Windows::Foundation::IAsyncOperation<bool> WaitForConnectionStateAsync(
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
 {
+	if (g_shuttingDown) co_return;
 	picker.SetDisplayStatus(device, _(L"Connecting"), DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 
 	bool openRequested = false;
@@ -474,13 +482,27 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					return; // Device already removed or doesn't exist
 				}
 
+				// Reject stale StateChanged events from a PREVIOUS connection
+				// instance for the same device. After Close(), the old connection's
+				// StateChanged(Closed) may fire asynchronously on the WinRT thread
+				// pool AFTER a new connection's map entry has already been inserted.
+				// Without this identity check the stale callback would wrongly erase
+				// the new connection from the map and clobber its tracking state.
+				if (it->second.second != sender)
+				{
+					return;
+				}
+
 				if (sender.State() == AudioPlaybackConnectionState::Opened)
 				{
 					g_pendingConnections.erase(deviceId);
 					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
 					auto deviceCopy = it->second.first;
 					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
-					PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 1);
+					if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 1))
+					{
+						delete p;
+					}
 				}
 				else if (sender.State() == AudioPlaybackConnectionState::Closed)
 				{
@@ -492,10 +514,16 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
 					auto deviceCopy = it->second.first;
 					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
-					PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0);
+					if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+					{
+						delete p;
+					}
 					// Post message to main thread for delayed reconnect - avoids race condition on g_audioPlaybackConnections
 					auto deviceIdAlloc = new std::wstring(deviceId);
-					PostMessageW(g_hWnd, WM_RECONNECTDEVICE, reinterpret_cast<WPARAM>(deviceIdAlloc), 0);
+					if (!PostMessageW(g_hWnd, WM_RECONNECTDEVICE, reinterpret_cast<WPARAM>(deviceIdAlloc), 0))
+					{
+						delete deviceIdAlloc;
+					}
 					g_audioPlaybackConnections.erase(it);
 				}
 			});
@@ -583,12 +611,24 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 	}
 	catch (winrt::hresult_error const& ex)
 	{
+		// Guard the swprintf retry loop with a hard upper bound so a format
+		// error (e.g. malformed UTF-16 in the error message) that causes
+		// swprintf to keep returning -1 won't balloon the buffer to OOM.
 		errorMessage.resize(64);
-		while (1)
+		constexpr size_t kMaxErrorSize = 8192;
+		while (true)
 		{
 			auto result = swprintf(errorMessage.data(), errorMessage.size(), L"%s (0x%08X)", ex.message().c_str(), static_cast<uint32_t>(ex.code()));
 			if (result < 0)
 			{
+				if (errorMessage.size() >= kMaxErrorSize)
+				{
+					// Fallback: at least emit the error code so diagnostics aren't lost
+					errorMessage = L"System error (0x00000000)";
+					swprintf(errorMessage.data(), errorMessage.size(), L"System error (0x%08X)", static_cast<uint32_t>(ex.code()));
+					errorMessage.resize(wcslen(errorMessage.data()));
+					break;
+				}
 				errorMessage.resize(errorMessage.size() * 2);
 			}
 			else
@@ -616,6 +656,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
 {
+	if (g_shuttingDown) co_return;
 	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
 	if (device.Name().empty())
 	{
@@ -627,6 +668,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view devi
 
 winrt::fire_and_forget ReconnectDeviceTask(std::wstring deviceId)
 {
+	if (g_shuttingDown) co_return;
 	// Delay to allow audio subsystem to release resources before allowing reconnect
 	co_await winrt::resume_after(kReconnectOpenDelay);
 
@@ -665,6 +707,20 @@ void SetupDevicePicker()
 				// release. Without this, the next OpenAsync may complete on
 				// a stale endpoint that reports Opened but produces no audio.
 				g_lastDisconnectTime[deviceIdStr] = std::chrono::steady_clock::now();
+				// Cap the map at kMaxDisconnectEntries; evict the oldest
+				// entry when the threshold is exceeded. Prevents unbounded
+				// memory growth from devices the user disconnected once and
+				// never reconnects to.
+				constexpr size_t kMaxDisconnectEntries = 32;
+				while (g_lastDisconnectTime.size() > kMaxDisconnectEntries)
+				{
+					auto oldest = std::min_element(
+						g_lastDisconnectTime.begin(),
+						g_lastDisconnectTime.end(),
+						[](const auto& a, const auto& b) { return a.second < b.second; });
+					if (oldest != g_lastDisconnectTime.end())
+						g_lastDisconnectTime.erase(oldest);
+				}
 			}
 		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);

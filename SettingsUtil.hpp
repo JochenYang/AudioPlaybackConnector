@@ -3,13 +3,13 @@
 constexpr auto CONFIG_NAME = L"AudioPlaybackConnector.json";
 constexpr auto BUFFER_SIZE = 4096;
 
-void DefaultSettings()
+inline void DefaultSettings()
 {
 	g_reconnect = false;
 	g_lastDevices.clear();
 }
 
-void LoadSettings()
+inline void LoadSettings()
 {
 	try
 	{
@@ -45,7 +45,7 @@ void LoadSettings()
 	CATCH_LOG();
 }
 
-void SaveSettings()
+inline void SaveSettings()
 {
 	try
 	{

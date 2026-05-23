@@ -1,7 +1,7 @@
 #pragma once
 
 // https://msdn.microsoft.com/en-us/magazine/mt763237
-std::wstring Utf8ToUtf16(std::string_view utf8)
+inline std::wstring Utf8ToUtf16(std::string_view utf8)
 {
 	if (utf8.empty())
 	{
@@ -34,7 +34,7 @@ std::wstring Utf8ToUtf16(std::string_view utf8)
 	return utf16;
 }
 
-std::string Utf16ToUtf8(std::wstring_view utf16)
+inline std::string Utf16ToUtf8(std::wstring_view utf16)
 {
 	if (utf16.empty())
 	{
@@ -71,7 +71,7 @@ std::string Utf16ToUtf8(std::wstring_view utf16)
 
 // https://docs.microsoft.com/en-us/windows/uwp/cpp-and-winrt-apis/author-coclasses#add-helper-types-and-functions
 // License: see the https://github.com/MicrosoftDocs/windows-uwp/blob/docs/LICENSE-CODE file
-auto GetModuleFsPath(HMODULE hModule)
+inline auto GetModuleFsPath(HMODULE hModule)
 {
 	std::wstring path(MAX_PATH, L'\0');
 	DWORD actualSize;
