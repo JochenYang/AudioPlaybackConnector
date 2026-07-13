@@ -160,23 +160,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_DESTROY:
 	{
 		g_shuttingDown = true;
-		std::lock_guard<std::mutex> lock(g_connMutex);
-		for (const auto& connection : g_audioPlaybackConnections)
+		std::vector<std::pair<DeviceInformation, AudioPlaybackConnection>> connectionsToClose;
 		{
-			connection.second.second.Close();
-			// Flush any lingering A2DP state in USB Bluetooth dongle firmware
-			// so a fresh session (after restart) doesn't land on stale endpoint.
-			auto flushConn = AudioPlaybackConnection::TryCreateFromId(connection.first);
-			if (flushConn) flushConn.Close();
-			g_devicePicker.SetDisplayStatus(connection.second.first, {}, DevicePickerDisplayStatusOptions::None);
+			std::lock_guard<std::mutex> lock(g_connMutex);
+			for (const auto& connection : g_audioPlaybackConnections)
+			{
+				connectionsToClose.push_back(connection.second);
+			}
+			// SaveSettings encodes the current g_reconnect flag into the JSON;
+			// LoadSettings on next startup decides whether to actually reconnect.
+			// Both branches were identical, collapsed to remove the dead split.
+			SaveSettings();
+			g_audioPlaybackConnections.clear();
+			g_pendingConnections.clear();
+			g_lastDisconnectTime.clear();
 		}
-		// SaveSettings encodes the current g_reconnect flag into the JSON;
-		// LoadSettings on next startup decides whether to actually reconnect.
-		// Both branches were identical, collapsed to remove the dead split.
-		SaveSettings();
-		g_audioPlaybackConnections.clear();
-		g_pendingConnections.clear();
-		g_lastDisconnectTime.clear();
+		for (const auto& connection : connectionsToClose)
+		{
+			connection.second.Close();
+			g_devicePicker.SetDisplayStatus(connection.first, {}, DevicePickerDisplayStatusOptions::None);
+		}
 	}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		if (g_hIconLight) { DestroyIcon(g_hIconLight); g_hIconLight = nullptr; }
@@ -707,20 +710,14 @@ void SetupDevicePicker()
 	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
 		auto device = args.Device();
 		auto deviceIdStr = std::wstring(device.Id());
+		AudioPlaybackConnection connectionToClose = nullptr;
 		{
 			std::lock_guard lock(g_connMutex);
 			g_pendingConnections.erase(deviceIdStr);
 			auto it = g_audioPlaybackConnections.find(deviceIdStr);
 			if (it != g_audioPlaybackConnections.end())
 			{
-				it->second.second.Close();
-				// USB Bluetooth dongles (CSR/Realtek etc.) cache A2DP endpoint
-				// state in their firmware after Close(). Creating and immediately
-				// closing a temp connection prods the dongle to flush that state
-				// so the next OpenAsync lands on a clean endpoint instead of a
-				// half-released one that reports Opened but routes no audio.
-				auto flushConn = AudioPlaybackConnection::TryCreateFromId(deviceIdStr);
-				if (flushConn) flushConn.Close();
+				connectionToClose = it->second.second;
 				g_audioPlaybackConnections.erase(it);
 				// Stamp the disconnect time so an immediate user-driven
 				// reconnect on the same device waits for the A2DP route to
@@ -743,6 +740,7 @@ void SetupDevicePicker()
 				}
 			}
 		}
+		if (connectionToClose) connectionToClose.Close();
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
 	});
 }
