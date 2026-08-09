@@ -216,14 +216,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 		if (!connectionsToClose.empty())
 		{
-			[conns = std::move(connectionsToClose)]() -> winrt::fire_and_forget {
+			// By-value parameter rather than a capture: see the note in
+			// DisconnectButtonClicked - a capturing lambda temporary dies at
+			// the end of this expression and would dangle after the first
+			// suspension point.
+			[](std::vector<std::pair<DeviceInformation, AudioPlaybackConnection>> conns) -> winrt::fire_and_forget {
 				co_await winrt::resume_background();
 				for (const auto& connection : conns)
 				{
 					try { connection.second.Close(); }
 					catch (...) { LOG_CAUGHT_EXCEPTION(); }
 				}
-			}();
+			}(std::move(connectionsToClose));
 		}
 	}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -895,10 +899,15 @@ void SetupDevicePicker()
 		{
 			// Close() off the UI thread: a hung Bluetooth stack must not
 			// freeze the picker. The coroutine touches no globals.
-			[conn = std::move(connectionToClose)]() -> winrt::fire_and_forget {
+			// The connection MUST be passed as a by-value parameter, not
+			// captured: a capturing lambda invoked as a temporary is destroyed
+			// at the end of this expression, while the coroutine outlives it
+			// past the first suspension. Parameters are copied into the
+			// coroutine frame and stay valid; captures would dangle.
+			[](AudioPlaybackConnection conn) -> winrt::fire_and_forget {
 				co_await winrt::resume_background();
 				try { conn.Close(); } catch (...) { LOG_CAUGHT_EXCEPTION(); }
-			}();
+			}(std::move(connectionToClose));
 		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
 	});
