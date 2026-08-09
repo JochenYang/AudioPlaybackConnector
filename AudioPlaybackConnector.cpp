@@ -43,6 +43,31 @@ static constexpr auto kOpenAsyncTimeout = std::chrono::seconds(5);
 // point and bail out, preventing accesses to already-destroyed globals.
 static bool g_shuttingDown = false;
 
+// Marshalled UI status update. DevicePicker is a XAML object; all
+// SetDisplayStatus calls originating from WinRT thread-pool coroutines go
+// through WM_UI_UPDATE instead of touching the picker cross-thread.
+struct UiStatusUpdate
+{
+	winrt::Windows::Devices::Enumeration::DeviceInformation device;
+	std::wstring status;
+	winrt::Windows::Devices::Enumeration::DevicePickerDisplayStatusOptions options{ winrt::Windows::Devices::Enumeration::DevicePickerDisplayStatusOptions::None };
+};
+
+// Stamp a per-device disconnect timestamp and cap the map so repeated
+// external disconnects cannot grow it unboundedly.
+static void StampDisconnectTime(const std::wstring& deviceId)
+{
+	constexpr size_t kMaxDisconnectEntries = 32;
+	g_lastDisconnectTime[deviceId] = std::chrono::steady_clock::now();
+	while (g_lastDisconnectTime.size() > kMaxDisconnectEntries)
+	{
+		auto oldest = std::min_element(g_lastDisconnectTime.begin(), g_lastDisconnectTime.end(),
+			[](const auto& a, const auto& b) { return a.second < b.second; });
+		if (oldest != g_lastDisconnectTime.end())
+			g_lastDisconnectTime.erase(oldest);
+	}
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
 	_In_ LPWSTR    lpCmdLine,
@@ -137,18 +162,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	if (WM_UI_UPDATE && message == WM_UI_UPDATE)
 	{
-		auto p = reinterpret_cast<std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>*>(wParam);
+		auto p = reinterpret_cast<UiStatusUpdate*>(wParam);
 		if (p)
 		{
-			bool isActive = (lParam == 1);
-			if (isActive)
+			// The embedded device can be null (e.g. a failed CreateFromIdAsync);
+			// SetDisplayStatus on such input may throw, and an uncaught
+			// exception in the UI thread would crash the message loop.
+			try
 			{
-				g_devicePicker.SetDisplayStatus(p->second, _(L"Connected"),
-					DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+				g_devicePicker.SetDisplayStatus(p->device,
+					p->status.empty() ? winrt::hstring{} : winrt::hstring(p->status),
+					p->options);
 			}
-			else
+			catch (winrt::hresult_error const&)
 			{
-				g_devicePicker.SetDisplayStatus(p->second, {}, DevicePickerDisplayStatusOptions::None);
+				LOG_CAUGHT_EXCEPTION();
+			}
+			catch (...)
+			{
+				LOG_CAUGHT_EXCEPTION();
 			}
 			delete p;
 		}
@@ -175,10 +207,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			g_pendingConnections.clear();
 			g_lastDisconnectTime.clear();
 		}
+		// Clear the picker status on the UI thread first, then close the
+		// connections on a background thread so a hung Bluetooth stack cannot
+		// freeze the shutdown path. The coroutine touches no globals.
 		for (const auto& connection : connectionsToClose)
 		{
-			connection.second.Close();
 			g_devicePicker.SetDisplayStatus(connection.first, {}, DevicePickerDisplayStatusOptions::None);
+		}
+		if (!connectionsToClose.empty())
+		{
+			[conns = std::move(connectionsToClose)]() -> winrt::fire_and_forget {
+				co_await winrt::resume_background();
+				for (const auto& connection : conns)
+				{
+					try { connection.second.Close(); }
+					catch (...) { LOG_CAUGHT_EXCEPTION(); }
+				}
+			}();
 		}
 	}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -289,7 +334,9 @@ void SetupFlyout()
 	Button button;
 	button.Content(winrt::box_value(_(L"Exit")));
 	button.HorizontalAlignment(HorizontalAlignment::Right);
-	button.Click([&](const auto&, const auto&) {
+	// Capture the CheckBox by value: the flyout outlives this function, and a
+	// reference capture would dangle once the stack-local wrapper is destroyed.
+	button.Click([checkbox](const auto&, const auto&) {
 		g_reconnect = checkbox.IsChecked().Value();
 		PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
 	});
@@ -404,12 +451,27 @@ winrt::Windows::Foundation::IAsyncOperation<bool> WaitForConnectionStateAsync(
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
 {
+	UNREFERENCED_PARAMETER(picker);
 	if (g_shuttingDown) co_return;
-	picker.SetDisplayStatus(device, _(L"Connecting"), DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+	auto deviceId = std::wstring(device.Id());
+	// Timestamp of this attempt's start; the failure cleanup uses it to tell
+	// "user disconnected mid-flight" (fresh stamp, skip error) apart from
+	// "attempt failed on its own" (no stamp or an older one, report error).
+	const auto attemptStart = std::chrono::steady_clock::now();
+	// Marshal UI operation to main thread via PostMessage (coroutine may run on WinRT thread-pool)
+	{
+		auto p = new UiStatusUpdate{ device, _(L"Connecting"), DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton };
+		if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+		{
+			delete p;
+		}
+	}
 
 	bool openRequested = false;
 	std::wstring errorMessage;
-	auto deviceId = std::wstring(device.Id());
+	// Declared outside the try block so the failure cleanup below can check
+	// map identity against this exact instance (and never close a newer one).
+	AudioPlaybackConnection connection{ nullptr };
 
 	try
 	{
@@ -425,7 +487,12 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			{
 				if (existing->second.second.State() == AudioPlaybackConnectionState::Opened)
 				{
-					picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+					// Marshal UI operation to main thread via PostMessage (coroutine may run on WinRT thread-pool)
+					auto p = new UiStatusUpdate{ device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton };
+					if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+					{
+						delete p;
+					}
 				}
 				co_return;
 			}
@@ -472,7 +539,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			if (flushConn) flushConn.Close();
 		}
 
-		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
+		connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
 			{
@@ -483,7 +550,12 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					g_pendingConnections.erase(deviceId);
 					if (connection.State() == AudioPlaybackConnectionState::Opened)
 					{
-						picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+						// Marshal UI operation to main thread via PostMessage (coroutine may run on WinRT thread-pool)
+						auto p = new UiStatusUpdate{ device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton };
+						if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+						{
+							delete p;
+						}
 					}
 					co_return;
 				}
@@ -513,9 +585,8 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 				{
 					g_pendingConnections.erase(deviceId);
 					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
-					auto deviceCopy = it->second.first;
-					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
-					if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 1))
+					auto p = new UiStatusUpdate{ it->second.first, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton };
+					if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
 					{
 						delete p;
 					}
@@ -526,10 +597,9 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					// Stamp the disconnect time so a follow-up connect on the
 					// same device waits out kPostDisconnectCooldown for the
 					// A2DP route to fully release before reopening.
-					g_lastDisconnectTime[deviceId] = std::chrono::steady_clock::now();
+					StampDisconnectTime(deviceId);
 					// Marshal UI operation to main thread via PostMessage (StateChanged may execute on arbitrary WinRT thread)
-					auto deviceCopy = it->second.first;
-					auto p = new std::pair<std::wstring, winrt::Windows::Devices::Enumeration::DeviceInformation>(deviceId, std::move(deviceCopy));
+					auto p = new UiStatusUpdate{ it->second.first, {}, DevicePickerDisplayStatusOptions::None };
 					if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
 					{
 						delete p;
@@ -573,11 +643,29 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					if (co_await WaitForConnectionStateAsync(connection, AudioPlaybackConnectionState::Opened, kOpenedWaitTimeout))
 					{
 						std::lock_guard lock(g_connMutex);
-						g_pendingConnections.erase(deviceId);
-						// Successful open clears any stale cooldown stamp so a
-						// later disconnect+reconnect cycle restarts the timer.
-						g_lastDisconnectTime.erase(deviceId);
-						picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+						// The user may have disconnected this device while the open
+						// was in flight; only update the UI if the map still holds
+						// THIS connection instance, not a newer one.
+						auto it = g_audioPlaybackConnections.find(deviceId);
+						if (it != g_audioPlaybackConnections.end() && it->second.second == connection)
+						{
+							g_pendingConnections.erase(deviceId);
+							// Successful open clears any stale cooldown stamp so a
+							// later disconnect+reconnect cycle restarts the timer.
+							g_lastDisconnectTime.erase(deviceId);
+							// Marshal UI operation to main thread via PostMessage (coroutine may run on WinRT thread-pool)
+							auto p = new UiStatusUpdate{ device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton };
+							if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+							{
+								delete p;
+							}
+						}
+						else
+						{
+							// Stale attempt: drop the pending flag but keep the UI
+							// state owned by the current connection.
+							g_pendingConnections.erase(deviceId);
+						}
 					}
 					else
 					{
@@ -623,6 +711,14 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		else
 		{
 			errorMessage = _(L"Unknown error");
+			// connection == nullptr means TryCreateFromId failed, so no map
+			// entry can exist and there is no identity ambiguity: surface the
+			// retryable error right away instead of leaving "Connecting" up.
+			auto p = new UiStatusUpdate{ device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton };
+			if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+			{
+				delete p;
+			}
 		}
 	}
 	catch (winrt::hresult_error const& ex)
@@ -655,28 +751,87 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		}
 		LOG_CAUGHT_EXCEPTION();
 	}
+	catch (...)
+	{
+		// Belt-and-braces: an exception that is not a winrt::hresult_error
+		// escaping a fire_and_forget coroutine would terminate the process.
+		LOG_CAUGHT_EXCEPTION();
+		errorMessage = _(L"Unknown error");
+	}
 
 	if (!openRequested)
 	{
 		std::lock_guard lock(g_connMutex);
 		g_pendingConnections.erase(deviceId);
 		auto it = g_audioPlaybackConnections.find(deviceId);
-		if (it != g_audioPlaybackConnections.end())
+		// Only tear down and report the error if the map still holds THIS
+		// connection instance. A stale failure must not close or clobber the
+		// UI state of a connection the user has since created (fast
+		// disconnect -> reconnect race).
+		if (it != g_audioPlaybackConnections.end() && it->second.second == connection)
 		{
 			it->second.second.Close();
 			g_audioPlaybackConnections.erase(it);
+			// Marshal UI operation to main thread via PostMessage (coroutine may run on WinRT thread-pool)
+			auto p = new UiStatusUpdate{ device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton };
+			if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+			{
+				delete p;
+			}
 		}
-		picker.SetDisplayStatus(device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
+		else if (it == g_audioPlaybackConnections.end() && connection)
+		{
+			// Map entry gone but the connection was created: either the inner
+			// catch already cleaned up (this attempt failed, feedback needed),
+			// or the user / an external source disconnected mid-flight (which
+			// stamps a fresh disconnect time). Only report the error when the
+			// disconnect stamp predates this attempt, so a freshly shown
+			// Disconnected state is never overwritten by a stale error.
+			auto lastDisc = g_lastDisconnectTime.find(deviceId);
+			if (lastDisc == g_lastDisconnectTime.end() || lastDisc->second < attemptStart)
+			{
+				// Marshal UI operation to main thread via PostMessage (coroutine may run on WinRT thread-pool)
+				auto p = new UiStatusUpdate{ device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton };
+				if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+				{
+					delete p;
+				}
+			}
+		}
+		// it exists but is not this connection (user disconnected and
+		// reconnected): stale failure, skip silently.
 	}
 }
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
 {
+	UNREFERENCED_PARAMETER(picker);
 	if (g_shuttingDown) co_return;
-	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+	DeviceInformation device{ nullptr };
+	try
+	{
+		device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		// Device lookup failed (e.g. removed/disabled); surface a retryable
+		// error instead of letting the exception escape the coroutine.
+		LOG_CAUGHT_EXCEPTION();
+		auto p = new UiStatusUpdate{ device, _(L"Device not available"), DevicePickerDisplayStatusOptions::ShowRetryButton };
+		if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+		{
+			delete p;
+		}
+		co_return;
+	}
 	if (device.Name().empty())
 	{
-		picker.SetDisplayStatus(device, _(L"Device not available"), DevicePickerDisplayStatusOptions::ShowRetryButton);
+		// Marshal UI operation to main thread via PostMessage (coroutine may run on WinRT thread-pool)
+		auto p = new UiStatusUpdate{ device, _(L"Device not available"), DevicePickerDisplayStatusOptions::ShowRetryButton };
+		if (!PostMessageW(g_hWnd, WM_UI_UPDATE, reinterpret_cast<WPARAM>(p), 0))
+		{
+			delete p;
+		}
 		co_return;
 	}
 	ConnectDevice(picker, device);
@@ -688,7 +843,17 @@ winrt::fire_and_forget ReconnectDeviceTask(std::wstring deviceId)
 	// Delay to allow audio subsystem to release resources before allowing reconnect
 	co_await winrt::resume_after(kReconnectOpenDelay);
 
-	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+	DeviceInformation device{ nullptr };
+	try
+	{
+		device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		// Device no longer exists; silently skip this reconnect attempt.
+		LOG_CAUGHT_EXCEPTION();
+		co_return;
+	}
 	if (!device.Name().empty())
 	{
 		ConnectDevice(g_devicePicker, device);
@@ -723,24 +888,18 @@ void SetupDevicePicker()
 				// reconnect on the same device waits for the A2DP route to
 				// release. Without this, the next OpenAsync may complete on
 				// a stale endpoint that reports Opened but produces no audio.
-				g_lastDisconnectTime[deviceIdStr] = std::chrono::steady_clock::now();
-				// Cap the map at kMaxDisconnectEntries; evict the oldest
-				// entry when the threshold is exceeded. Prevents unbounded
-				// memory growth from devices the user disconnected once and
-				// never reconnects to.
-				constexpr size_t kMaxDisconnectEntries = 32;
-				while (g_lastDisconnectTime.size() > kMaxDisconnectEntries)
-				{
-					auto oldest = std::min_element(
-						g_lastDisconnectTime.begin(),
-						g_lastDisconnectTime.end(),
-						[](const auto& a, const auto& b) { return a.second < b.second; });
-					if (oldest != g_lastDisconnectTime.end())
-						g_lastDisconnectTime.erase(oldest);
-				}
+				StampDisconnectTime(deviceIdStr);
 			}
 		}
-		if (connectionToClose) connectionToClose.Close();
+		if (connectionToClose)
+		{
+			// Close() off the UI thread: a hung Bluetooth stack must not
+			// freeze the picker. The coroutine touches no globals.
+			[conn = std::move(connectionToClose)]() -> winrt::fire_and_forget {
+				co_await winrt::resume_background();
+				try { conn.Close(); } catch (...) { LOG_CAUGHT_EXCEPTION(); }
+			}();
+		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
 	});
 }
